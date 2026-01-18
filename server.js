@@ -56,7 +56,7 @@ app.get("/api/ipeds/search", async (req, res) => {
       return res.status(400).json({ error: "name parameter required" });
     }
     
-    console.log(\`Searching for: "\${name}"\`);
+    console.log(`Searching for: "${name}"`);
     
     // Use College Scorecard API for search
     const apiKey = "wvO1UtAGFz7RQXxj3lRfbaIu9ed2USO39n82A8zL";
