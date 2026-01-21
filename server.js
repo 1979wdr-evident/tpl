@@ -39,7 +39,7 @@ const IPEDS_FILES = {
 const AVAILABLE_YEARS = Object.keys(IPEDS_FILES).map(Number).sort((a, b) => b - a);
 
 app.get('/health', (req, res) => {
-  res.json({
+  res.json({ 
     status: 'ok',
     uptime: process.uptime(),
     memoryUsage: process.memoryUsage(),
@@ -48,54 +48,127 @@ app.get('/health', (req, res) => {
   });
 });
 
-// SEARCH
+// NEW: Search institutions by name using real IPEDS HD file
 app.get('/api/ipeds/search', async (req, res) => {
   try {
     const { name, limit = 10, year = '2023' } = req.query;
-    if (!name) return res.status(400).json({ error: 'name parameter required' });
-
+    
+    if (!name) {
+      return res.status(400).json({ error: 'name parameter required' });
+    }
+    
     const yearInt = parseInt(year);
     if (!IPEDS_FILES[yearInt]) {
-      return res.status(400).json({ error: `Year ${year} not available`, availableYears: AVAILABLE_YEARS });
+      return res.status(400).json({ 
+        error: `Year ${year} not available`,
+        availableYears: AVAILABLE_YEARS
+      });
     }
-
-    const hdData = await downloadAndParseIPEDS(IPEDS_FILES[yearInt].HD, yearInt);
+    
+    console.log(`\n🔍 Searching IPEDS for: "${name}" (${yearInt})`);
+    
+    // Download/cache HD (Directory) file
+    const hdFile = IPEDS_FILES[yearInt].HD;
+    const hdData = await downloadAndParseIPEDS(hdFile, yearInt);
+    
+    if (!hdData || hdData.length === 0) {
+      return res.status(500).json({ error: 'Failed to load IPEDS directory data' });
+    }
+    
+    // Search by institution name (case-insensitive)
     const searchTerm = name.toLowerCase();
-
-    const matches = hdData
-      .filter(r => (r.INSTNM || '').toLowerCase().includes(searchTerm))
-      .sort((a, b) => a.INSTNM.localeCompare(b.INSTNM))
-      .slice(0, parseInt(limit))
-      .map(r => ({
-        unitid: r.UNITID,
-        name: r.INSTNM,
-        city: r.CITY,
-        state: r.STABBR,
-        url: r.WEBADDR || r.WEBADM || ''
-      }));
-
-    res.json({ results: matches });
-  } catch (e) {
-    res.status(500).json({ error: 'Search failed', message: e.message });
+    const matches = hdData.filter(row => {
+      const instName = (row.INSTNM || '').toLowerCase();
+      return instName.includes(searchTerm);
+    });
+    
+    // Sort by relevance (exact matches first, then starts-with, then contains)
+    matches.sort((a, b) => {
+      const aName = (a.INSTNM || '').toLowerCase();
+      const bName = (b.INSTNM || '').toLowerCase();
+      
+      const aExact = aName === searchTerm;
+      const bExact = bName === searchTerm;
+      if (aExact && !bExact) return -1;
+      if (!aExact && bExact) return 1;
+      
+      const aStarts = aName.startsWith(searchTerm);
+      const bStarts = bName.startsWith(searchTerm);
+      if (aStarts && !bStarts) return -1;
+      if (!aStarts && bStarts) return 1;
+      
+      return aName.localeCompare(bName);
+    });
+    
+    // Limit results
+    const limitedMatches = matches.slice(0, parseInt(limit));
+    
+    // Transform to expected format
+    const results = limitedMatches.map(row => ({
+      unitid: row.UNITID,
+      name: row.INSTNM,
+      city: row.CITY,
+      state: row.STABBR,
+      url: row.WEBADDR || row.WEBADM || ''
+    }));
+    
+    console.log(`✅ Found ${results.length} matches (from ${matches.length} total)`);
+    
+    res.json({ results });
+    
+  } catch (error) {
+    console.error('❌ Search error:', error);
+    res.status(500).json({ 
+      error: 'Search failed',
+      message: error.message
+    });
   }
 });
 
 app.get('/api/ipeds', async (req, res) => {
   try {
     const { unitid, year = '2023' } = req.query;
-    if (!unitid) return res.status(400).json({ error: 'unitid parameter required' });
-
     const yearInt = parseInt(year);
+
+    if (!IPEDS_FILES[yearInt]) {
+      return res.status(400).json({ 
+        error: `Year ${year} not available`,
+        availableYears: AVAILABLE_YEARS
+      });
+    }
+
+    if (!unitid) {
+      return res.status(400).json({ error: 'unitid parameter required' });
+    }
+
+    console.log(`\n=== Request for UNITID: ${unitid}, Year: ${yearInt} ===`);
+
     const cacheKey = `${yearInt}-${unitid}`;
-    if (dataCache[cacheKey]) return res.json({ ...dataCache[cacheKey], cached: true });
+    if (dataCache[cacheKey]) {
+      console.log('✅ Returning cached data');
+      return res.json({ ...dataCache[cacheKey], cached: true });
+    }
 
-    const profile = await fetchCompleteProfile(unitid, yearInt);
-    if (!profile) return res.status(404).json({ error: 'Institution not found' });
+    const startTime = Date.now();
+    const institutionData = await fetchCompleteProfile(unitid, yearInt);
 
-    dataCache[cacheKey] = profile;
-    res.json(profile);
-  } catch (e) {
-    res.status(500).json({ error: 'Internal server error', message: e.message });
+    if (!institutionData) {
+      return res.status(404).json({ error: 'Institution not found' });
+    }
+
+    dataCache[cacheKey] = institutionData;
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    console.log(`✅ Response generated in ${duration}s`);
+
+    res.json(institutionData);
+
+  } catch (error) {
+    console.error('❌ Error:', error);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message
+    });
   }
 });
 
@@ -106,100 +179,218 @@ app.post('/api/clear-cache', (req, res) => {
 });
 
 async function fetchCompleteProfile(unitid, year) {
-  const f = IPEDS_FILES[year];
+  const files = IPEDS_FILES[year];
+  
+  console.log(`\n📥 Downloading ALL 10 IPEDS files for ${year-1}-${year}...`);
 
-  const [hd, effy, drvgr, ic, sfa, drvef, adm, comp, sal, fin] = await Promise.all([
-    downloadAndParseIPEDS(f.HD, year),
-    downloadAndParseIPEDS(f.EFFY, year),
-    downloadAndParseIPEDS(f.DRVGR, year),
-    downloadAndParseIPEDS(f.IC, year),
-    downloadAndParseIPEDS(f.SFA, year),
-    downloadAndParseIPEDS(f.DRVEF, year),
-    downloadAndParseIPEDS(f.ADM, year),
-    downloadAndParseIPEDS(f.C, year),
-    downloadAndParseIPEDS(f.SAL, year),
-    downloadAndParseIPEDS(f.FIN, year)
+  const [hdData, effyData, drvgrData, icData, sfaData, drvefData, admData, compData, salData, finData] = await Promise.all([
+    downloadAndParseIPEDS(files.HD, year),
+    downloadAndParseIPEDS(files.EFFY, year),
+    downloadAndParseIPEDS(files.DRVGR, year),
+    downloadAndParseIPEDS(files.IC, year),
+    downloadAndParseIPEDS(files.SFA, year),
+    downloadAndParseIPEDS(files.DRVEF, year),
+    downloadAndParseIPEDS(files.ADM, year),
+    downloadAndParseIPEDS(files.C, year),
+    downloadAndParseIPEDS(files.SAL, year),
+    downloadAndParseIPEDS(files.FIN, year)
   ]);
 
-  const inst = hd.find(r => r.UNITID === unitid);
-  if (!inst) return null;
+  console.log('✅ All files downloaded');
 
-  return buildCompleteProfile(
-    inst,
-    effy.find(r => r.UNITID === unitid),
-    drvgr.find(r => r.UNITID === unitid),
-    ic.find(r => r.UNITID === unitid),
-    sfa.find(r => r.UNITID === unitid),
-    drvef.find(r => r.UNITID === unitid),
-    adm.find(r => r.UNITID === unitid),
-    comp.filter(r => r.UNITID === unitid),
-    sal.find(r => r.UNITID === unitid),
-    fin.find(r => r.UNITID === unitid),
-    year
-  );
+  const hd = hdData.find(row => row.UNITID === unitid);
+  const effy = effyData.find(row => row.UNITID === unitid);
+  const drvgr = drvgrData.find(row => row.UNITID === unitid);
+  const ic = icData.find(row => row.UNITID === unitid);
+  const sfa = sfaData.find(row => row.UNITID === unitid);
+  const drvef = drvefData.find(row => row.UNITID === unitid);
+  const adm = admData.find(row => row.UNITID === unitid);
+  const sal = salData.find(row => row.UNITID === unitid);
+  const fin = finData.find(row => row.UNITID === unitid);
+  const comp = compData.filter(row => row.UNITID === unitid);
+
+  if (!hd) {
+    console.log(`❌ UNITID ${unitid} not found`);
+    return null;
+  }
+
+  console.log(`✅ Found: ${hd.INSTNM} (${comp.length} program records)`);
+
+  return buildCompleteProfile(hd, effy, drvgr, ic, sfa, drvef, adm, comp, sal, fin, year);
 }
 
 async function downloadAndParseIPEDS(fileName, year) {
-  const key = `${fileName}-${year}`;
-  if (fileCache[key]) return fileCache[key];
+  const cacheKey = `${fileName}-${year}`;
+  
+  if (fileCache[cacheKey]) {
+    console.log(`  📦 Cached ${fileName}`);
+    return fileCache[cacheKey];
+  }
 
-  const res = await fetch(`https://nces.ed.gov/ipeds/datacenter/data/${fileName}.zip`);
-  if (!res.ok) return [];
+  const url = `https://nces.ed.gov/ipeds/datacenter/data/${fileName}.zip`;
+  console.log(`  ⬇️  ${fileName}...`);
+  
+  const response = await fetch(url);
+  
+  if (!response.ok) {
+    console.log(`  ⚠️  ${fileName} unavailable (${response.status})`);
+    fileCache[cacheKey] = [];
+    return [];
+  }
 
-  const zip = new AdmZip(await res.buffer());
-  const csv = zip.getEntries().find(e => e.entryName.endsWith('.csv'));
-  if (!csv) return [];
-
-  const parsed = Papa.parse(csv.getData().toString('utf8'), { header: true, skipEmptyLines: true });
-  fileCache[key] = parsed.data;
+  const buffer = await response.buffer();
+  const zip = new AdmZip(buffer);
+  const csvEntry = zip.getEntries().find(e => e.entryName.endsWith('.csv'));
+  
+  if (!csvEntry) {
+    fileCache[cacheKey] = [];
+    return [];
+  }
+  
+  const csvData = csvEntry.getData().toString('utf8');
+  const parsed = Papa.parse(csvData, { header: true, skipEmptyLines: true });
+  
+  console.log(`  ✅ ${fileName} (${parsed.data.length.toLocaleString()} rows)`);
+  
+  fileCache[cacheKey] = parsed.data;
   return parsed.data;
 }
 
 function buildCompleteProfile(hd, effy, drvgr, ic, sfa, drvef, adm, comp, sal, fin, year) {
-  const num = v => (v && v !== '.' ? Number(v) : null);
+  
+  const getNum = (val) => {
+    if (!val || val === '.' || val === '') return null;
+    const num = parseFloat(val);
+    return isNaN(num) ? null : num;
+  };
 
-  const completions = comp
-    .map(c => ({
-      cipCode: c.CIPCODE,
-      cipTitle: c.CIPTITLE,
-      awardLevel: c.AWLEVEL,
-      completions: num(c.CTOTALT)
-    }))
-    .filter(p => p.completions > 0);
+  const getPct = (val) => {
+    const num = getNum(val);
+    return num !== null ? Math.round(num) : null;
+  };
 
-  const topProgramsByCompletions = [...completions]
-    .sort((a, b) => b.completions - a.completions)
-    .slice(0, 15)
-    .map((p, i) => ({ ...p, rank: i + 1 }));
+  const getField = (obj, fieldNames) => {
+    if (!obj) return null;
+    for (const field of fieldNames) {
+      if (obj[field] !== undefined && obj[field] !== null && obj[field] !== '.' && obj[field] !== '') {
+        return obj[field];
+      }
+    }
+    return null;
+  };
 
   return {
     unitid: hd.UNITID,
     year,
+    
     institutionName: hd.INSTNM,
     city: hd.CITY,
     state: hd.STABBR,
+    location: `${hd.CITY}, ${hd.STABBR}`,
+    zipCode: hd.ZIP,
     website: hd.WEBADDR || hd.WEBADM,
+    
+    institutionType: hd.ICLEVEL === '1' ? 'Four or more years' : 
+                     hd.ICLEVEL === '2' ? 'At least 2 but less than 4 years' :
+                     hd.ICLEVEL === '3' ? 'Less than 2 years' : 'Unknown',
+    
+    control: hd.CONTROL === '1' ? 'Public' :
+             hd.CONTROL === '2' ? 'Private nonprofit' :
+             hd.CONTROL === '3' ? 'Private for-profit' : 'Unknown',
+    
     carnegieClassification: hd.C18BASIC || hd.C21BASIC,
+    yearFounded: getNum(hd.FOUNDDATE),
     religiousAffiliation: hd.RELAFFIL,
+    locale: hd.LOCALE,
+    
     regionalAccreditor: hd.ACCREDAGENCY,
-
+    
     enrollment: {
-      total: num(effy?.EFYTOTLT),
-      undergraduate: num(effy?.EFUG),
-      graduate: num(effy?.EFGRAD)
+      total: getNum(getField(effy, ['EFYTOTLT', 'EFYTOTLM', 'EFYTOTLW'])),
+      undergraduate: getNum(getField(effy, ['EFUG'])),
+      graduate: getNum(getField(effy, ['EFGRAD'])),
+      fullTime: getNum(getField(effy, ['EFYFT'])),
+      partTime: getNum(getField(effy, ['EFYPT'])),
+      undergraduateFTE: getNum(getField(drvef, ['UGENRL', 'UGENRLT'])),
+      graduateFTE: getNum(getField(drvef, ['GRENRL', 'GRENRLT']))
     },
-
-    completions,
-
-    programCatalog: {
-      source: 'IPEDS Completions',
-      year,
-      programs: completions,
-      topProgramsByCompletions
+    
+    retentionRate: getPct(getField(drvef, ['RET_PCF', 'RET_PTF'])),
+    graduationRate: getPct(getField(drvgr, ['GRTYPE4', 'GRTYPE6'])),
+    
+    tuition: {
+      inState: getNum(getField(ic, ['TUITION2', 'TUITION3', 'CHG2AY3'])),
+      outOfState: getNum(getField(ic, ['TUITION3', 'TUITION2', 'CHG3AY3'])),
+      books: getNum(ic.CHG4AY3),
+      roomBoard: getNum(ic.CHG5AY3)
+    },
+    
+    financialAid: {
+      undergradReceivingAid: getPct(sfa?.UAGRNTP),
+      avgAmountGrant: getNum(sfa?.UAGRNTA),
+      avgAmountLoan: getNum(sfa?.UFLOANA)
+    },
+    
+    admissions: {
+      applicants: getNum(adm?.APPLCN),
+      admitted: getNum(adm?.ADMSSN),
+      enrolled: getNum(adm?.ENRLT),
+      acceptanceRate: getPct(adm?.ADMCON),
+      yieldRate: getPct(adm?.ENRLRAT),
+      satMath25: getNum(adm?.SATMT25),
+      satMath75: getNum(adm?.SATMT75),
+      satRead25: getNum(adm?.SATVR25),
+      satRead75: getNum(adm?.SATVR75),
+      actComposite25: getNum(adm?.ACTCM25),
+      actComposite75: getNum(adm?.ACTCM75)
+    },
+    
+    completions: comp.map(c => ({
+      cipCode: c.CIPCODE,
+      major: c.CIPTITLE,
+      awardLevel: c.AWLEVEL,
+      count: getNum(c.CTOTALT)
+    })).filter(c => c.count > 0),
+    
+    faculty: {
+      totalFTE: getNum(getField(sal, ['HRTOTLT', 'HRTOTLM'])),
+      averageSalary: getNum(getField(sal, ['SASTOT', 'SASTOTM'])),
+      instructionalFTE: getNum(getField(sal, ['HRINST', 'HRINSTM']))
+    },
+    
+    finances: {
+      revenue: {
+        total: getNum(getField(fin, ['F1C01', 'F1TOTREV'])),
+        tuitionFees: getNum(getField(fin, ['F1C02', 'F1TUIFEE'])),
+        governmentGrants: getNum(getField(fin, ['F1C05', 'F1FEDGR', 'F1C06', 'F1STGR', 'F1C07', 'F1LOCGR'])),
+        privateGifts: getNum(getField(fin, ['F1C08', 'F1PRIV'])),
+        investmentReturn: getNum(getField(fin, ['F1C09', 'F1INVEST'])),
+        auxiliaryEnterprises: getNum(getField(fin, ['F1C14', 'F1AUX']))
+      },
+      expenses: {
+        total: getNum(getField(fin, ['F1C19', 'F1TOTEXP'])),
+        instruction: getNum(getField(fin, ['F1C20', 'F1INSTR'])),
+        research: getNum(getField(fin, ['F1C193', 'F1CRES'])),
+        publicService: getNum(getField(fin, ['F1C21', 'F1PUBSV'])),
+        academicSupport: getNum(getField(fin, ['F1C22', 'F1ACADM'])),
+        studentServices: getNum(getField(fin, ['F1C23', 'F1STUSER'])),
+        institutionalSupport: getNum(getField(fin, ['F1C24', 'F1INSUPT'])),
+        auxiliaryEnterprises: getNum(getField(fin, ['F1C28', 'F1AUX']))
+      }
     }
   };
 }
 
 app.listen(PORT, () => {
-  console.log(`🚀 IPEDS API running on port ${PORT}`);
+  console.log(`\n🚀 IPEDS API Server`);
+  console.log(`   Port: ${PORT}`);
+  console.log(`   Available years: ${AVAILABLE_YEARS.join(', ')}`);
+  console.log(`\nEndpoints:`);
+  console.log(`   GET  /health`);
+  console.log(`   GET  /api/ipeds/search?name={name}&limit=10&year=2023`);
+  console.log(`   GET  /api/ipeds?unitid={unitid}&year=2023`);
+  console.log(`   POST /api/clear-cache`);
+  console.log();
 });
+
+module.exports = app;
