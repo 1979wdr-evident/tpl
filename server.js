@@ -14,6 +14,11 @@ let fileCache = {};
 let dataCache = {};
 
 const IPEDS_FILES = {
+  2024: {
+    HD: 'HD2024', EFFY: 'EFFY2024', DRVGR: 'DRVGR2024',
+    IC: 'IC2024_AY', SFA: 'SFA2324', DRVEF: 'DRVEF2024',
+    ADM: 'ADM2024', C: 'C2024_A', SAL: 'SAL2324_IS', FIN: 'F2324_F1A'
+  },
   2023: {
     HD: 'HD2023', EFFY: 'EFFY2023', DRVGR: 'DRVGR2023',
     IC: 'IC2023_AY', SFA: 'SFA2223', DRVEF: 'DRVEF2023',
