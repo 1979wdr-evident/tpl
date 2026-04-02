@@ -9,8 +9,89 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
-let fileCache = {};
-let dataCache = {};
+/** Cap parsed “wide” IPEDS tables kept in RAM (HD, EFFY, …). Completions (C*) are NOT stored whole. */
+const MAX_FILE_CACHE_ENTRIES = parseInt(process.env.IPEDS_MAX_FILE_CACHE || '14', 10);
+/** Per–(file,year,UNITID) completion rows only — small arrays. */
+const MAX_COMP_UNIT_ENTRIES = parseInt(process.env.IPEDS_MAX_COMP_UNIT_CACHE || '400', 10);
+const MAX_DATA_CACHE_ENTRIES = parseInt(process.env.IPEDS_MAX_INST_CACHE || '100', 10);
+const MAX_CONCURRENT_PROFILES = parseInt(process.env.IPEDS_MAX_CONCURRENT_PROFILES || '2', 10);
+
+const fileCache = Object.create(null);
+const fileCacheOrder = [];
+const compUnitCache = Object.create(null);
+const compUnitOrder = [];
+const dataCache = Object.create(null);
+const dataCacheOrder = [];
+
+const inflightParse = new Map();
+const inflightComp = new Map();
+
+let profileSlots = 0;
+const profileWaiters = [];
+
+function touchLru(orderArr, key) {
+  const i = orderArr.indexOf(key);
+  if (i >= 0) orderArr.splice(i, 1);
+  orderArr.push(key);
+}
+
+function evictLru(cacheObj, orderArr, maxEntries) {
+  while (orderArr.length > maxEntries) {
+    const k = orderArr.shift();
+    if (k != null) delete cacheObj[k];
+  }
+}
+
+function getFileCache(key) {
+  if (!Object.prototype.hasOwnProperty.call(fileCache, key)) return undefined;
+  touchLru(fileCacheOrder, key);
+  evictLru(fileCache, fileCacheOrder, MAX_FILE_CACHE_ENTRIES);
+  return fileCache[key];
+}
+
+function setFileCache(key, val) {
+  fileCache[key] = val;
+  touchLru(fileCacheOrder, key);
+  evictLru(fileCache, fileCacheOrder, MAX_FILE_CACHE_ENTRIES);
+}
+
+function getCompUnitCache(ck) {
+  if (!Object.prototype.hasOwnProperty.call(compUnitCache, ck)) return undefined;
+  touchLru(compUnitOrder, ck);
+  evictLru(compUnitCache, compUnitOrder, MAX_COMP_UNIT_ENTRIES);
+  return compUnitCache[ck];
+}
+
+function setCompUnitCache(ck, rows) {
+  compUnitCache[ck] = rows;
+  touchLru(compUnitOrder, ck);
+  evictLru(compUnitCache, compUnitOrder, MAX_COMP_UNIT_ENTRIES);
+}
+
+function touchDataCache(key) {
+  touchLru(dataCacheOrder, key);
+  evictLru(dataCache, dataCacheOrder, MAX_DATA_CACHE_ENTRIES);
+}
+
+function setDataCache(key, val) {
+  dataCache[key] = val;
+  touchLru(dataCacheOrder, key);
+  evictLru(dataCache, dataCacheOrder, MAX_DATA_CACHE_ENTRIES);
+}
+
+async function withProfileLimit(fn) {
+  while (profileSlots >= MAX_CONCURRENT_PROFILES) {
+    await new Promise((r) => profileWaiters.push(r));
+  }
+  profileSlots++;
+  try {
+    return await fn();
+  } finally {
+    profileSlots--;
+    const next = profileWaiters.shift();
+    if (next) next();
+  }
+}
 
 const IPEDS_FILES = {
   2024: {
@@ -43,12 +124,19 @@ const IPEDS_FILES = {
 const AVAILABLE_YEARS = Object.keys(IPEDS_FILES).map(Number).sort((a, b) => b - a);
 
 app.get('/health', (req, res) => {
-  res.json({ 
+  res.json({
     status: 'ok',
     uptime: process.uptime(),
     memoryUsage: process.memoryUsage(),
     cachedFiles: Object.keys(fileCache).length,
-    cachedInstitutions: Object.keys(dataCache).length
+    cachedCompletionSlices: Object.keys(compUnitCache).length,
+    cachedInstitutions: Object.keys(dataCache).length,
+    limits: {
+      fileCache: MAX_FILE_CACHE_ENTRIES,
+      compUnit: MAX_COMP_UNIT_ENTRIES,
+      dataCache: MAX_DATA_CACHE_ENTRIES,
+      concurrentProfiles: MAX_CONCURRENT_PROFILES
+    }
   });
 });
 
@@ -56,58 +144,53 @@ app.get('/health', (req, res) => {
 app.get('/api/ipeds/search', async (req, res) => {
   try {
     const { name, limit = 10, year = '2023' } = req.query;
-    
+
     if (!name) {
       return res.status(400).json({ error: 'name parameter required' });
     }
-    
+
     const yearInt = parseInt(year);
     if (!IPEDS_FILES[yearInt]) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: `Year ${year} not available`,
         availableYears: AVAILABLE_YEARS
       });
     }
-    
+
     console.log(`\n🔍 Searching IPEDS for: "${name}" (${yearInt})`);
-    
-    // Download/cache HD (Directory) file
+
     const hdFile = IPEDS_FILES[yearInt].HD;
     const hdData = await downloadAndParseIPEDS(hdFile, yearInt);
-    
+
     if (!hdData || hdData.length === 0) {
       return res.status(500).json({ error: 'Failed to load IPEDS directory data' });
     }
-    
-    // Search by institution name (case-insensitive)
+
     const searchTerm = name.toLowerCase();
     const matches = hdData.filter(row => {
       const instName = (row.INSTNM || '').toLowerCase();
       return instName.includes(searchTerm);
     });
-    
-    // Sort by relevance (exact matches first, then starts-with, then contains)
+
     matches.sort((a, b) => {
       const aName = (a.INSTNM || '').toLowerCase();
       const bName = (b.INSTNM || '').toLowerCase();
-      
+
       const aExact = aName === searchTerm;
       const bExact = bName === searchTerm;
       if (aExact && !bExact) return -1;
       if (!aExact && bExact) return 1;
-      
+
       const aStarts = aName.startsWith(searchTerm);
       const bStarts = bName.startsWith(searchTerm);
       if (aStarts && !bStarts) return -1;
       if (!aStarts && bStarts) return 1;
-      
+
       return aName.localeCompare(bName);
     });
-    
-    // Limit results
+
     const limitedMatches = matches.slice(0, parseInt(limit));
-    
-    // Transform to expected format
+
     const results = limitedMatches.map(row => ({
       unitid: row.UNITID,
       name: row.INSTNM,
@@ -115,14 +198,14 @@ app.get('/api/ipeds/search', async (req, res) => {
       state: row.STABBR,
       url: row.WEBADDR || row.WEBADM || ''
     }));
-    
+
     console.log(`✅ Found ${results.length} matches (from ${matches.length} total)`);
-    
+
     res.json({ results });
-    
+
   } catch (error) {
     console.error('❌ Search error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Search failed',
       message: error.message
     });
@@ -135,7 +218,7 @@ app.get('/api/ipeds', async (req, res) => {
     const yearInt = parseInt(year);
 
     if (!IPEDS_FILES[yearInt]) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: `Year ${year} not available`,
         availableYears: AVAILABLE_YEARS
       });
@@ -148,19 +231,20 @@ app.get('/api/ipeds', async (req, res) => {
     console.log(`\n=== Request for UNITID: ${unitid}, Year: ${yearInt} ===`);
 
     const cacheKey = `${yearInt}-${String(unitid).trim()}`;
-    if (dataCache[cacheKey]) {
+    if (Object.prototype.hasOwnProperty.call(dataCache, cacheKey)) {
       console.log('✅ Returning cached data');
+      touchDataCache(cacheKey);
       return res.json({ ...dataCache[cacheKey], cached: true });
     }
 
     const startTime = Date.now();
-    const institutionData = await fetchCompleteProfile(unitid, yearInt);
+    const institutionData = await withProfileLimit(() => fetchCompleteProfile(unitid, yearInt));
 
     if (!institutionData) {
       return res.status(404).json({ error: 'Institution not found' });
     }
 
-    dataCache[cacheKey] = institutionData;
+    setDataCache(cacheKey, institutionData);
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`✅ Response generated in ${duration}s`);
@@ -169,7 +253,7 @@ app.get('/api/ipeds', async (req, res) => {
 
   } catch (error) {
     console.error('❌ Error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Internal server error',
       message: error.message
     });
@@ -177,30 +261,94 @@ app.get('/api/ipeds', async (req, res) => {
 });
 
 app.post('/api/clear-cache', (req, res) => {
-  fileCache = {};
-  dataCache = {};
+  for (const k of Object.keys(fileCache)) delete fileCache[k];
+  fileCacheOrder.length = 0;
+  for (const k of Object.keys(compUnitCache)) delete compUnitCache[k];
+  compUnitOrder.length = 0;
+  for (const k of Object.keys(dataCache)) delete dataCache[k];
+  dataCacheOrder.length = 0;
+  inflightParse.clear();
+  inflightComp.clear();
   res.json({ message: 'Cache cleared' });
 });
 
+/**
+ * Completions (C*) files are huge. Stream-parse and keep only rows for this UNITID.
+ * Never store the full national table in memory or fileCache.
+ */
+async function downloadCompletionsForUnitId(fileName, year, unitid) {
+  const uid = String(unitid).trim();
+  const ck = `${fileName}-${year}-${uid}`;
+  const hit = getCompUnitCache(ck);
+  if (hit !== undefined) {
+    console.log(`  📦 Cached completions slice ${fileName} (${hit.length} rows)`);
+    return hit;
+  }
+  if (inflightComp.has(ck)) {
+    return inflightComp.get(ck);
+  }
+
+  const promise = (async () => {
+    const url = `https://nces.ed.gov/ipeds/datacenter/data/${fileName}.zip`;
+    console.log(`  ⬇️  ${fileName} (completions, UNITID ${uid} only)…`);
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      console.log(`  ⚠️  ${fileName} unavailable (${response.status})`);
+      setCompUnitCache(ck, []);
+      return [];
+    }
+
+    const buffer = await response.buffer();
+    const zip = new AdmZip(buffer);
+    const csvEntry = zip.getEntries().find(e => e.entryName.endsWith('.csv'));
+
+    if (!csvEntry) {
+      setCompUnitCache(ck, []);
+      return [];
+    }
+
+    const csvData = csvEntry.getData().toString('utf8');
+    const rowMatch = (row) => row && String(row.UNITID ?? '').trim() === uid;
+    const rows = [];
+    Papa.parse(csvData, {
+      header: true,
+      skipEmptyLines: true,
+      step: (result) => {
+        if (rowMatch(result.data)) rows.push(result.data);
+      }
+    });
+
+    console.log(`  ✅ ${fileName} — kept ${rows.length} row(s) for UNITID ${uid} (streamed)`);
+    setCompUnitCache(ck, rows);
+    return rows;
+  })();
+
+  inflightComp.set(ck, promise);
+  try {
+    return await promise;
+  } finally {
+    inflightComp.delete(ck);
+  }
+}
+
 async function fetchCompleteProfile(unitid, year) {
   const files = IPEDS_FILES[year];
-  
-  console.log(`\n📥 Downloading ALL 10 IPEDS files for ${year-1}-${year}...`);
 
-  const [hdData, effyData, drvgrData, icData, sfaData, drvefData, admData, compData, salData, finData] = await Promise.all([
-    downloadAndParseIPEDS(files.HD, year),
-    downloadAndParseIPEDS(files.EFFY, year),
-    downloadAndParseIPEDS(files.DRVGR, year),
-    downloadAndParseIPEDS(files.IC, year),
-    downloadAndParseIPEDS(files.SFA, year),
-    downloadAndParseIPEDS(files.DRVEF, year),
-    downloadAndParseIPEDS(files.ADM, year),
-    downloadAndParseIPEDS(files.C, year),
-    downloadAndParseIPEDS(files.SAL, year),
-    downloadAndParseIPEDS(files.FIN, year)
-  ]);
+  console.log(`\n📥 Loading IPEDS for ${year - 1}-${year} (sequential + bounded RAM)…`);
 
-  console.log('✅ All files downloaded');
+  const hdData = await downloadAndParseIPEDS(files.HD, year);
+  const effyData = await downloadAndParseIPEDS(files.EFFY, year);
+  const drvgrData = await downloadAndParseIPEDS(files.DRVGR, year);
+  const icData = await downloadAndParseIPEDS(files.IC, year);
+  const sfaData = await downloadAndParseIPEDS(files.SFA, year);
+  const drvefData = await downloadAndParseIPEDS(files.DRVEF, year);
+  const admData = await downloadAndParseIPEDS(files.ADM, year);
+  const compData = await downloadCompletionsForUnitId(files.C, year, unitid);
+  const salData = await downloadAndParseIPEDS(files.SAL, year);
+  const finData = await downloadAndParseIPEDS(files.FIN, year);
+
+  console.log('✅ All files loaded');
 
   const uid = String(unitid).trim();
   const rowMatch = (row) => row && String(row.UNITID ?? '').trim() === uid;
@@ -214,7 +362,7 @@ async function fetchCompleteProfile(unitid, year) {
   const adm = admData.find(rowMatch);
   const sal = salData.find(rowMatch);
   const fin = finData.find(rowMatch);
-  const comp = compData.filter(rowMatch);
+  const comp = compData;
 
   if (!hd) {
     console.log(`❌ UNITID ${unitid} not found`);
@@ -228,43 +376,57 @@ async function fetchCompleteProfile(unitid, year) {
 
 async function downloadAndParseIPEDS(fileName, year) {
   const cacheKey = `${fileName}-${year}`;
-  
-  if (fileCache[cacheKey]) {
+
+  const cached = getFileCache(cacheKey);
+  if (cached !== undefined) {
     console.log(`  📦 Cached ${fileName}`);
-    return fileCache[cacheKey];
+    return cached;
   }
 
-  const url = `https://nces.ed.gov/ipeds/datacenter/data/${fileName}.zip`;
-  console.log(`  ⬇️  ${fileName}...`);
-  
-  const response = await fetch(url);
-  
-  if (!response.ok) {
-    console.log(`  ⚠️  ${fileName} unavailable (${response.status})`);
-    fileCache[cacheKey] = [];
-    return [];
+  if (inflightParse.has(cacheKey)) {
+    return inflightParse.get(cacheKey);
   }
 
-  const buffer = await response.buffer();
-  const zip = new AdmZip(buffer);
-  const csvEntry = zip.getEntries().find(e => e.entryName.endsWith('.csv'));
-  
-  if (!csvEntry) {
-    fileCache[cacheKey] = [];
-    return [];
+  const promise = (async () => {
+    const url = `https://nces.ed.gov/ipeds/datacenter/data/${fileName}.zip`;
+    console.log(`  ⬇️  ${fileName}…`);
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      console.log(`  ⚠️  ${fileName} unavailable (${response.status})`);
+      setFileCache(cacheKey, []);
+      return [];
+    }
+
+    const buffer = await response.buffer();
+    const zip = new AdmZip(buffer);
+    const csvEntry = zip.getEntries().find(e => e.entryName.endsWith('.csv'));
+
+    if (!csvEntry) {
+      setFileCache(cacheKey, []);
+      return [];
+    }
+
+    const csvData = csvEntry.getData().toString('utf8');
+    const parsed = Papa.parse(csvData, { header: true, skipEmptyLines: true });
+
+    console.log(`  ✅ ${fileName} (${parsed.data.length.toLocaleString()} rows)`);
+
+    setFileCache(cacheKey, parsed.data);
+    return parsed.data;
+  })();
+
+  inflightParse.set(cacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    inflightParse.delete(cacheKey);
   }
-  
-  const csvData = csvEntry.getData().toString('utf8');
-  const parsed = Papa.parse(csvData, { header: true, skipEmptyLines: true });
-  
-  console.log(`  ✅ ${fileName} (${parsed.data.length.toLocaleString()} rows)`);
-  
-  fileCache[cacheKey] = parsed.data;
-  return parsed.data;
 }
 
 function buildCompleteProfile(hd, effy, drvgr, ic, sfa, drvef, adm, comp, sal, fin, year) {
-  
+
   const getNum = (val) => {
     if (!val || val === '.' || val === '') return null;
     const num = parseFloat(val);
@@ -289,29 +451,29 @@ function buildCompleteProfile(hd, effy, drvgr, ic, sfa, drvef, adm, comp, sal, f
   return {
     unitid: hd.UNITID,
     year,
-    
+
     institutionName: hd.INSTNM,
     city: hd.CITY,
     state: hd.STABBR,
     location: `${hd.CITY}, ${hd.STABBR}`,
     zipCode: hd.ZIP,
     website: hd.WEBADDR || hd.WEBADM,
-    
-    institutionType: hd.ICLEVEL === '1' ? 'Four or more years' : 
+
+    institutionType: hd.ICLEVEL === '1' ? 'Four or more years' :
                      hd.ICLEVEL === '2' ? 'At least 2 but less than 4 years' :
                      hd.ICLEVEL === '3' ? 'Less than 2 years' : 'Unknown',
-    
+
     control: hd.CONTROL === '1' ? 'Public' :
              hd.CONTROL === '2' ? 'Private nonprofit' :
              hd.CONTROL === '3' ? 'Private for-profit' : 'Unknown',
-    
+
     carnegieClassification: hd.C18BASIC || hd.C21BASIC,
     yearFounded: getNum(hd.FOUNDDATE),
     religiousAffiliation: hd.RELAFFIL,
     locale: hd.LOCALE,
-    
+
     regionalAccreditor: hd.ACCREDAGENCY,
-    
+
     enrollment: {
       total: getNum(getField(effy, ['EFYTOTLT', 'EFYTOTLM', 'EFYTOTLW'])),
       undergraduate: getNum(getField(effy, ['EFUG'])),
@@ -321,23 +483,23 @@ function buildCompleteProfile(hd, effy, drvgr, ic, sfa, drvef, adm, comp, sal, f
       undergraduateFTE: getNum(getField(drvef, ['UGENRL', 'UGENRLT'])),
       graduateFTE: getNum(getField(drvef, ['GRENRL', 'GRENRLT']))
     },
-    
+
     retentionRate: getPct(getField(drvef, ['RET_PCF', 'RET_PTF'])),
     graduationRate: getPct(getField(drvgr, ['GRTYPE4', 'GRTYPE6'])),
-    
+
     tuition: {
       inState: getNum(getField(ic, ['TUITION2', 'TUITION3', 'CHG2AY3'])),
       outOfState: getNum(getField(ic, ['TUITION3', 'TUITION2', 'CHG3AY3'])),
       books: getNum(ic?.CHG4AY3),
       roomBoard: getNum(ic?.CHG5AY3)
     },
-    
+
     financialAid: {
       undergradReceivingAid: getPct(sfa?.UAGRNTP),
       avgAmountGrant: getNum(sfa?.UAGRNTA),
       avgAmountLoan: getNum(sfa?.UFLOANA)
     },
-    
+
     admissions: {
       applicants: getNum(adm?.APPLCN),
       admitted: getNum(adm?.ADMSSN),
@@ -351,20 +513,20 @@ function buildCompleteProfile(hd, effy, drvgr, ic, sfa, drvef, adm, comp, sal, f
       actComposite25: getNum(adm?.ACTCM25),
       actComposite75: getNum(adm?.ACTCM75)
     },
-    
+
     completions: comp.map(c => ({
       cipCode: c.CIPCODE,
       major: c.CIPTITLE,
       awardLevel: c.AWLEVEL,
       count: getNum(c.CTOTALT)
     })).filter(c => c.count > 0),
-    
+
     faculty: {
       totalFTE: getNum(getField(sal, ['HRTOTLT', 'HRTOTLM'])),
       averageSalary: getNum(getField(sal, ['SASTOT', 'SASTOTM'])),
       instructionalFTE: getNum(getField(sal, ['HRINST', 'HRINSTM']))
     },
-    
+
     finances: {
       revenue: {
         total: getNum(getField(fin, ['F1C01', 'F1TOTREV'])),
