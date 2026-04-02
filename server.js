@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
@@ -148,7 +147,7 @@ app.get('/api/ipeds', async (req, res) => {
 
     console.log(`\n=== Request for UNITID: ${unitid}, Year: ${yearInt} ===`);
 
-    const cacheKey = `${yearInt}-${unitid}`;
+    const cacheKey = `${yearInt}-${String(unitid).trim()}`;
     if (dataCache[cacheKey]) {
       console.log('✅ Returning cached data');
       return res.json({ ...dataCache[cacheKey], cached: true });
@@ -203,16 +202,19 @@ async function fetchCompleteProfile(unitid, year) {
 
   console.log('✅ All files downloaded');
 
-  const hd = hdData.find(row => row.UNITID === unitid);
-  const effy = effyData.find(row => row.UNITID === unitid);
-  const drvgr = drvgrData.find(row => row.UNITID === unitid);
-  const ic = icData.find(row => row.UNITID === unitid);
-  const sfa = sfaData.find(row => row.UNITID === unitid);
-  const drvef = drvefData.find(row => row.UNITID === unitid);
-  const adm = admData.find(row => row.UNITID === unitid);
-  const sal = salData.find(row => row.UNITID === unitid);
-  const fin = finData.find(row => row.UNITID === unitid);
-  const comp = compData.filter(row => row.UNITID === unitid);
+  const uid = String(unitid).trim();
+  const rowMatch = (row) => row && String(row.UNITID ?? '').trim() === uid;
+
+  const hd = hdData.find(rowMatch);
+  const effy = effyData.find(rowMatch);
+  const drvgr = drvgrData.find(rowMatch);
+  const ic = icData.find(rowMatch);
+  const sfa = sfaData.find(rowMatch);
+  const drvef = drvefData.find(rowMatch);
+  const adm = admData.find(rowMatch);
+  const sal = salData.find(rowMatch);
+  const fin = finData.find(rowMatch);
+  const comp = compData.filter(rowMatch);
 
   if (!hd) {
     console.log(`❌ UNITID ${unitid} not found`);
@@ -326,8 +328,8 @@ function buildCompleteProfile(hd, effy, drvgr, ic, sfa, drvef, adm, comp, sal, f
     tuition: {
       inState: getNum(getField(ic, ['TUITION2', 'TUITION3', 'CHG2AY3'])),
       outOfState: getNum(getField(ic, ['TUITION3', 'TUITION2', 'CHG3AY3'])),
-      books: getNum(ic.CHG4AY3),
-      roomBoard: getNum(ic.CHG5AY3)
+      books: getNum(ic?.CHG4AY3),
+      roomBoard: getNum(ic?.CHG5AY3)
     },
     
     financialAid: {
