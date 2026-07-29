@@ -94,6 +94,13 @@ async function withProfileLimit(fn) {
 }
 
 const IPEDS_FILES = {
+  // Completions CYYYY_A = awards Jul 1 (Y-1) – Jun 30 Y (collection Y/(Y+1) Fall).
+  // Newer NCES zips often live under /complete-data-files/ before /datacenter/data/.
+  2025: {
+    HD: 'HD2025', EFFY: 'EFFY2025', DRVGR: 'DRVGR2025',
+    IC: 'IC2025', SFA: 'SFA2425', DRVEF: 'DRVEF2025',
+    ADM: 'ADM2025', C: 'C2025_A', SAL: 'SAL2425_IS', FIN: 'F2425_F1A'
+  },
   2024: {
     HD: 'HD2024', EFFY: 'EFFY2024', DRVGR: 'DRVGR2024',
     IC: 'IC2024_AY', SFA: 'SFA2324', DRVEF: 'DRVEF2024',
@@ -128,6 +135,8 @@ app.get('/health', (req, res) => {
     status: 'ok',
     uptime: process.uptime(),
     memoryUsage: process.memoryUsage(),
+    availableYears: AVAILABLE_YEARS,
+    preferredYear: AVAILABLE_YEARS[0] || null,
     cachedFiles: Object.keys(fileCache).length,
     cachedCompletionSlices: Object.keys(compUnitCache).length,
     cachedInstitutions: Object.keys(dataCache).length,
@@ -140,10 +149,32 @@ app.get('/health', (req, res) => {
   });
 });
 
+/** NCES zip URL candidates (newer releases often only on complete-data-files first). */
+function ipedsZipUrlCandidates(fileName) {
+  const name = String(fileName || '').replace(/\.zip$/i, '');
+  return [
+    `https://nces.ed.gov/ipeds/datacenter/data/${name}.zip`,
+    `https://nces.ed.gov/ipeds/complete-data-files/${name}.zip`
+  ];
+}
+
+async function fetchIpedsZipBuffer(fileName) {
+  let lastStatus = null;
+  for (const url of ipedsZipUrlCandidates(fileName)) {
+    const response = await fetch(url);
+    if (response.ok) {
+      return { buffer: await response.buffer(), url };
+    }
+    lastStatus = response.status;
+    console.log(`  ⚠️  ${fileName} miss ${response.status} @ ${url}`);
+  }
+  return { buffer: null, url: null, status: lastStatus };
+}
+
 // NEW: Search institutions by name using real IPEDS HD file
 app.get('/api/ipeds/search', async (req, res) => {
   try {
-    const { name, limit = 10, year = '2023' } = req.query;
+    const { name, limit = 10, year = String(AVAILABLE_YEARS[0] || 2025) } = req.query;
 
     if (!name) {
       return res.status(400).json({ error: 'name parameter required' });
@@ -214,7 +245,7 @@ app.get('/api/ipeds/search', async (req, res) => {
 
 app.get('/api/ipeds', async (req, res) => {
   try {
-    const { unitid, year = '2023' } = req.query;
+    const { unitid, year = String(AVAILABLE_YEARS[0] || 2025) } = req.query;
     const yearInt = parseInt(year);
 
     if (!IPEDS_FILES[yearInt]) {
@@ -289,17 +320,15 @@ async function downloadCompletionsForUnitId(fileName, year, unitid) {
   }
 
   const promise = (async () => {
-    const url = `https://nces.ed.gov/ipeds/datacenter/data/${fileName}.zip`;
     console.log(`  ⬇️  ${fileName} (completions, UNITID ${uid} only)…`);
-    const response = await fetch(url);
+    const { buffer, status } = await fetchIpedsZipBuffer(fileName);
 
-    if (!response.ok) {
-      console.log(`  ⚠️  ${fileName} unavailable (${response.status})`);
+    if (!buffer) {
+      console.log(`  ⚠️  ${fileName} unavailable (${status || 'no mirror'})`);
       setCompUnitCache(ck, []);
       return [];
     }
 
-    const buffer = await response.buffer();
     const zip = new AdmZip(buffer);
     const csvEntry = zip.getEntries().find(e => e.entryName.endsWith('.csv'));
 
@@ -388,18 +417,15 @@ async function downloadAndParseIPEDS(fileName, year) {
   }
 
   const promise = (async () => {
-    const url = `https://nces.ed.gov/ipeds/datacenter/data/${fileName}.zip`;
     console.log(`  ⬇️  ${fileName}…`);
+    const { buffer, status } = await fetchIpedsZipBuffer(fileName);
 
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      console.log(`  ⚠️  ${fileName} unavailable (${response.status})`);
+    if (!buffer) {
+      console.log(`  ⚠️  ${fileName} unavailable (${status || 'no mirror'})`);
       setFileCache(cacheKey, []);
       return [];
     }
 
-    const buffer = await response.buffer();
     const zip = new AdmZip(buffer);
     const csvEntry = zip.getEntries().find(e => e.entryName.endsWith('.csv'));
 
