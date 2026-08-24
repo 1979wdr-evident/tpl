@@ -95,7 +95,8 @@ async function withProfileLimit(fn) {
 
 const IPEDS_FILES = {
   // Completions CYYYY_A = awards Jul 1 (Y-1) – Jun 30 Y (collection Y/(Y+1) Fall).
-  // Newer NCES zips often live under /complete-data-files/ before /datacenter/data/.
+  // Fall 2025 provisional (released Jul 2026): HD/IC/C/EFFY are on complete-data-files.
+  // Winter/spring 2025 surveys (ADM, SFA, SAL, FIN, DRV*) may still be unpublished — soft-miss OK.
   2025: {
     HD: 'HD2025', EFFY: 'EFFY2025', DRVGR: 'DRVGR2025',
     IC: 'IC2025', SFA: 'SFA2425', DRVEF: 'DRVEF2025',
@@ -149,26 +150,87 @@ app.get('/health', (req, res) => {
   });
 });
 
-/** NCES zip URL candidates (newer releases often only on complete-data-files first). */
+/**
+ * NCES zip URL candidates.
+ * Prefer /complete-data-files/ first — Fall 2025+ provisional zips (HD2025, C2025_A,
+ * EFFY2025, IC2025, …) live there; /datacenter/data/*2025* often 404s.
+ * Keep datacenter as fallback for older years still mirrored there.
+ */
 function ipedsZipUrlCandidates(fileName) {
   const name = String(fileName || '').replace(/\.zip$/i, '');
   return [
-    `https://nces.ed.gov/ipeds/datacenter/data/${name}.zip`,
-    `https://nces.ed.gov/ipeds/complete-data-files/${name}.zip`
+    `https://nces.ed.gov/ipeds/complete-data-files/${name}.zip`,
+    `https://nces.ed.gov/ipeds/datacenter/data/${name}.zip`
   ];
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isTransientNetworkError(err) {
+  const code = String(err?.code || '');
+  const msg = String(err?.message || err || '');
+  return (
+    code === 'ECONNRESET' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNREFUSED' ||
+    code === 'ENOTFOUND' ||
+    /ECONNRESET|ETIMEDOUT|socket hang up|network/i.test(msg)
+  );
+}
+
+/**
+ * Download an IPEDS zip with mirror fallback + retries.
+ * Never throws on NCES blips — callers soft-fail to empty tables.
+ */
 async function fetchIpedsZipBuffer(fileName) {
   let lastStatus = null;
-  for (const url of ipedsZipUrlCandidates(fileName)) {
-    const response = await fetch(url);
-    if (response.ok) {
-      return { buffer: await response.buffer(), url };
+  let lastError = null;
+  const urls = ipedsZipUrlCandidates(fileName);
+
+  for (const url of urls) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await fetch(url, { timeout: 60_000 });
+        if (response.ok) {
+          const buffer = await response.buffer();
+          if (buffer && buffer.length > 2000) {
+            if (attempt > 0 || url.includes('complete-data-files')) {
+              console.log(`  ✅ ${fileName} from ${url.includes('complete-data-files') ? 'complete-data-files' : 'datacenter'}`);
+            }
+            return { buffer, url };
+          }
+          lastStatus = response.status;
+          console.log(`  ⚠️  ${fileName} tiny/empty body @ ${url} (${buffer?.length || 0} bytes)`);
+          break;
+        }
+        lastStatus = response.status;
+        // 404/403 — try next mirror, no point retrying same URL.
+        if (response.status === 404 || response.status === 403) {
+          console.log(`  ⚠️  ${fileName} miss ${response.status} @ ${url}`);
+          break;
+        }
+        console.log(`  ⚠️  ${fileName} HTTP ${response.status} @ ${url} (attempt ${attempt + 1}/3)`);
+        await sleep(400 * (attempt + 1));
+      } catch (err) {
+        lastError = err;
+        const transient = isTransientNetworkError(err);
+        console.log(
+          `  ⚠️  ${fileName} ${transient ? 'network' : 'fetch'} error @ ${url} (attempt ${attempt + 1}/3): ${err?.message || err}`
+        );
+        if (!transient || attempt === 2) break;
+        await sleep(500 * (attempt + 1));
+      }
     }
-    lastStatus = response.status;
-    console.log(`  ⚠️  ${fileName} miss ${response.status} @ ${url}`);
   }
-  return { buffer: null, url: null, status: lastStatus };
+
+  return {
+    buffer: null,
+    url: null,
+    status: lastStatus,
+    error: lastError?.message || null
+  };
 }
 
 // NEW: Search institutions by name using real IPEDS HD file
@@ -321,10 +383,19 @@ async function downloadCompletionsForUnitId(fileName, year, unitid) {
 
   const promise = (async () => {
     console.log(`  ⬇️  ${fileName} (completions, UNITID ${uid} only)…`);
-    const { buffer, status } = await fetchIpedsZipBuffer(fileName);
+    let buffer = null;
+    let status = null;
+    let error = null;
+    try {
+      ({ buffer, status, error } = await fetchIpedsZipBuffer(fileName));
+    } catch (err) {
+      console.log(`  ⚠️  ${fileName} unexpected fetch failure: ${err?.message || err}`);
+      setCompUnitCache(ck, []);
+      return [];
+    }
 
     if (!buffer) {
-      console.log(`  ⚠️  ${fileName} unavailable (${status || 'no mirror'})`);
+      console.log(`  ⚠️  ${fileName} unavailable (${status || error || 'no mirror'})`);
       setCompUnitCache(ck, []);
       return [];
     }
@@ -418,10 +489,22 @@ async function downloadAndParseIPEDS(fileName, year) {
 
   const promise = (async () => {
     console.log(`  ⬇️  ${fileName}…`);
-    const { buffer, status } = await fetchIpedsZipBuffer(fileName);
+    let buffer = null;
+    let status = null;
+    let error = null;
+    try {
+      ({ buffer, status, error } = await fetchIpedsZipBuffer(fileName));
+    } catch (err) {
+      // fetchIpedsZipBuffer should not throw; belt-and-suspenders for Railway.
+      console.log(`  ⚠️  ${fileName} unexpected fetch failure: ${err?.message || err}`);
+      setFileCache(cacheKey, []);
+      return [];
+    }
 
     if (!buffer) {
-      console.log(`  ⚠️  ${fileName} unavailable (${status || 'no mirror'})`);
+      console.log(
+        `  ⚠️  ${fileName} unavailable (${status || error || 'no mirror'})`
+      );
       setFileCache(cacheKey, []);
       return [];
     }
